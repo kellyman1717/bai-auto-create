@@ -1,0 +1,20 @@
+# ==== KREDENSIAL & UANG — JANGAN PERNAH DI-PUSH ====
+# config.json berisi funder_mnemonic: siapa pun yang membacanya bisa
+# menguras wallet funder. accounts.json/wallet.txt berisi private key semua akun.
+config.json
+accounts.json
+accounts.json.tmp
+apikey.txt
+wallet.txt
+session_full.json
+
+# ==== hasil run ====
+*.log
+f_ascii.txt
+*.tmp
+
+# ==== python ====
+__pycache__/
+*.pyc
+.venv/
+venv/

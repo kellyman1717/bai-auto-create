@@ -1,0 +1,28 @@
+{
+  "base_url": "https://chat.b.ai",
+
+  "accounts_per_proxy": 5,
+
+  "proxy": null,
+
+  "min_pool": 12,
+  "refill_below": 4,
+  "refill_rounds": 4,
+  "refill_backoff": 3,
+  "validate_batch": 260,
+  "validate_workers": 48,
+  "validate_timeout": 8.0,
+  "source_min_interval": 60,
+  "proxy_attempts": 5,
+  "recent_avoid": 5,
+
+  "invite": null,
+  "chain_id": 56,
+
+  "funder_private_key": "",
+  "funder_mnemonic": "",
+  "chains": ["base"],
+
+  "delay_between_accounts": 3,
+  "retry_base_delay": 5
+}
