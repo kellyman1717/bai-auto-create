@@ -355,6 +355,39 @@ def wallet_key_saved(addr):
     return bool(funder and funder.address.lower() == want)
 
 
+def _base_fee(call):
+    """baseFeePerGas blok terakhir, atau 0 kalau chain-nya legacy (BNB/POL).
+    Dipakai untuk memutuskan tx type 2 vs legacy."""
+    try:
+        blk = call("eth_getBlockByNumber", ["latest", False]) or {}
+        bf = blk.get("baseFeePerGas")
+        return int(bf, 16) if bf else 0
+    except Exception:
+        return 0
+
+
+# GasPriceOracle predeploy OP-stack (Base & OP). Menagih L1 data fee di LUAR
+# gas*price: saldo harus menutup gas*price + L1 fee, kalau tidak tx-nya masuk
+# mempool lalu tidak pernah mined (nonce naik, saldo diam) — bug yang bikin
+# rantai saldo nyangkut di Base.
+L1_ORACLE = "0x420000000000000000000000000000000000000F"
+
+
+def _l1_fee(call, raw):
+    """L1 data fee utk `raw` (wei) via oracle getL1Fee(bytes). 0 kalau chain
+    tidak punya oracle (ETH/BNB/POL/Arbitrum — Arb sudah masuk estimasi gas)."""
+    try:
+        body = raw[2:]
+        n = len(body) // 2
+        data = ("0x49948e0e"
+                + hex(32)[2:].rjust(64, "0")
+                + hex(n)[2:].rjust(64, "0")
+                + body.ljust(((n + 31) // 32) * 64, "0"))
+        return int(call("eth_call", [{"to": L1_ORACLE, "data": data}, "latest"]), 16)
+    except Exception:
+        return 0
+
+
 def chain_transfer_all(chain, url, src_key, to_addr, dry_run=False):
     """Pindahkan SELURUH saldo native di satu chain: src_key -> to_addr.
 
@@ -424,29 +457,48 @@ def chain_transfer_all(chain, url, src_key, to_addr, dry_run=False):
     last_err = None
     for gas in TRANSFER_GASES:
         for buf in TRANSFER_BUFFERS:
-            # Buffer menaikkan gasPrice (bukan cuma mengurangi value): tx yang
+            # Buffer menaikkan harga gas (bukan cuma mengurangi value): tx yang
             # nyangkut di mempool baru bisa digantikan kalau harganya dinaikkan.
-            # Saldo & gasPrice dihitung ULANG tiap percobaan. Kalau tidak, percobaan
+            # Saldo & harga gas dihitung ULANG tiap percobaan. Kalau tidak, percobaan
             # kedua memakai saldo lama (padahal tx pertama sudah memakai sebagian
             # untuk gas) -> value terlalu besar -> tx di-revert tapi gas tetap
             # terbayar. Itu bikin nonce naik tanpa saldo berpindah (pernah kejadian).
             bal = int(call("eth_getBalance", [src.address, "latest"]), 16)
             gp = int(call("eth_gasPrice", []), 16)
-            gas_price = int(gp * buf)
-            cost = int(gas * gas_price)
-            if bal <= cost:
-                # Saldo tidak cukup untuk gas sebesar ini. `break` keluar dari loop
+            # EIP-1559 (Base/OP/Arb): base fee naik-turun tiap blok, dan tx legacy
+            # bisa ditolak "insufficient funds" walau eth_gasPrice kelihatan cukup
+            # — harga efektifnya = baseFee + priority. Pakai tx type 2 supaya
+            # harganya ikut aturan chain, bukan tebakan.
+            base_fee = _base_fee(call)
+            if base_fee:
+                tip = max(int(gp * 0.1), 10 ** 6)
+                gas_price = int((base_fee * 2 + tip) * buf)
+                tx_extra = {"maxFeePerGas": gas_price, "maxPriorityFeePerGas": tip,
+                            "type": 2}
+            else:
+                gas_price = int(gp * buf)
+                tx_extra = {"gasPrice": gas_price}
+            # Hitung value: saldo - gas*price - L1 data fee - margin.
+            # L1 fee (Base/OP) ditagih DI LUAR gas*price dan hanya bisa diukur dari
+            # tx yang sudah di-sign — jadi ukur sekali pakai tx dummy dulu. Tanpa
+            # ini tx diterima mempool lalu tidak pernah mined (nonce naik, saldo
+            # tidak pindah) — bug lama yang bikin rantai nyangkut di Base.
+            def _build(val):
+                t = {"to": to_addr, "value": max(val, 0), "gas": gas, "nonce": nonce,
+                     "chainId": chain_id, **tx_extra}
+                return "0x" + Account.sign_transaction(t, src_key).raw_transaction.hex()
+
+            l1 = _l1_fee(call, _build(0))          # tx dummy: ukur L1 fee-nya
+            cost = int(gas * gas_price) + l1
+            if bal <= cost + cost // 50:
+                # Saldo tidak cukup untuk gas + L1 fee. `break` keluar dari loop
                 # buffer lalu lanjut ke gas berikutnya (lebih besar = lebih mahal,
                 # jadi biasanya juga tidak cukup) — biar loop luar yang memutuskan.
-                last_err = f"saldo tidak cukup setelah gas ({bal / 1e18:.10f})"
+                last_err = (f"saldo tidak cukup setelah gas+L1 "
+                            f"({bal / 1e18:.10f} < {cost / 1e18:.10f})")
                 break
-            # Sisakan 1% dari cost sebagai margin: gasPrice di chain bisa naik
-            # sedikit antara saat dibaca dan saat tx diterima ("insufficient funds"
-            # kalau pas-pasan). Sisa ini ikut terangkut di hop berikutnya.
-            value = bal - cost - cost // 100
-            tx = {"to": to_addr, "value": value, "gas": gas, "nonce": nonce,
-                  "chainId": chain_id, "gasPrice": gas_price}
-            raw = "0x" + Account.sign_transaction(tx, src_key).raw_transaction.hex()
+            value = bal - cost - cost // 50        # margin 2%
+            raw = _build(value)
             if dry_run:
                 return {"chain": chain, "amount_wei": value, "tx": None,
                         "gas": gas, "buffer": buf}
@@ -852,6 +904,41 @@ def rest_headers(jwt):
             "X-Ainft-Auth-Token": f"Bearer {jwt}", "Referer": BASE + "/chat"}
 
 
+_TEAM_LOCK = threading.Lock()
+_TEAM_LAST = [0.0]
+
+
+def team_get(path, jwt, tries=5, min_gap=1.2):
+    """GET api.b.ai dengan throttle + retry 429.
+
+    api.b.ai rate-limit per IP (429 dengan body kosong). Scan puluhan akun
+    beruntun langsung kena limit — dan itu BUKAN salah proxy, jadi jangan
+    dilempar sebagai ProxyFailure: beri jarak minimum antar request lalu ulangi
+    dengan backoff.
+    """
+    url = f"{TEAM}{path}"
+    last = None
+    for i in range(tries):
+        with _TEAM_LOCK:
+            gap = time.time() - _TEAM_LAST[0]
+            if gap < min_gap:
+                time.sleep(min_gap - gap)
+            _TEAM_LAST[0] = time.time()
+        try:
+            r = http_get(url, None, headers=rest_headers(jwt))
+        except ProxyFailure as e:
+            last = e
+            time.sleep(1.5 * (i + 1))
+            continue
+        if r.status_code == 429:
+            last = RuntimeError(f"429 rate limit ({i + 1}/{tries})")
+            print(f"  ⏸  api.b.ai rate limit — tunggu lalu ulangi ({i + 1}/{tries})")
+            time.sleep(2.0 * (i + 1))
+            continue
+        return _json(r, path.rsplit("/", 1)[-1])
+    raise last or RuntimeError(f"{path}: gagal")
+
+
 # ==== CLAIMS ====
 def signup_bonus_status(jwt, proxy):
     """Status bonus 1M dari server: {eligible, claimable, claimed, amount, source_type}.
@@ -862,8 +949,7 @@ def signup_bonus_status(jwt, proxy):
     eligible=true amount=1000000, sedangkan 'bitget' -> eligible=false amount=0.
     """
     try:
-        d = _json(http_get(f"{TEAM}/api/activity/invite/my-registration", proxy,
-                           headers=rest_headers(jwt)), "my-registration").get("data") or {}
+        d = team_get("/api/activity/invite/my-registration", jwt).get("data") or {}
         return d.get("signup_bonus") or {}
     except Exception:
         return {}
@@ -902,8 +988,7 @@ def claim_signup_bonus(ck, addr, signer, chain, proxy, jwt=None):
 
 def claim_registration_reward(jwt, ck, addr, signer, chain, proxy):
     """300K — REST /invite/registration-reward/claim (body EKSAK builder mod 319438)."""
-    mr = _json(http_get(f"{TEAM}/api/activity/invite/my-registration", proxy,
-                        headers=rest_headers(jwt)), "my-registration")
+    mr = team_get("/api/activity/invite/my-registration", jwt)
     rr = (mr.get("data") or {}).get("registration_reward") or {}
     if rr.get("claimed"):
         print("ℹ️ registration reward 300K: sudah di-claim"); return True
@@ -923,8 +1008,25 @@ def claim_registration_reward(jwt, ck, addr, signer, chain, proxy):
         "encrypted_token": et, "message": msg, "signature": sign(signer, msg, chain),
         "turnstile_token": tt, "type": "wallet",
         "version": "solana" if chain == "solana" else "0x45"}}
-    r = _json(http_post(f"{TEAM}/api/activity/invite/registration-reward/claim", proxy,
-                        headers=rest_headers(jwt), data=json.dumps(body)), "claim 300K")
+    # api.b.ai juga rate-limit POST-nya; token turnstile di atas masih berlaku
+    # selama tidak dipakai, jadi aman diulang kalau kena 429.
+    r = None
+    for i in range(4):
+        with _TEAM_LOCK:
+            gap = time.time() - _TEAM_LAST[0]
+            if gap < 1.2:
+                time.sleep(1.2 - gap)
+            _TEAM_LAST[0] = time.time()
+        resp = http_post(f"{TEAM}/api/activity/invite/registration-reward/claim", None,
+                         headers=rest_headers(jwt), data=json.dumps(body))
+        if resp.status_code == 429:
+            print(f"  ⏸  claim 300K kena rate limit — tunggu lalu ulangi ({i + 1}/4)")
+            time.sleep(2.5 * (i + 1))
+            continue
+        r = _json(resp, "claim 300K")
+        break
+    if r is None:
+        print("❌ claim 300K: rate limit terus"); return False
     if not r.get("success"):
         print(f"❌ claim 300K: {r.get('message')}"); return False
     print(f"✅ CLAIM 300K OK: {json.dumps(r.get('data'))[:300]}"); return True
@@ -954,15 +1056,12 @@ def full_status(ck, proxy, quiet=False):
         print(f"💰 points: {pts.get('points_balance')}")
         print(f"🎁 signup 1M claimed: {claimed}")
     if jwt:
-        AH = rest_headers(jwt)
         try:
-            ic = _json(http_get(f"{TEAM}/api/activity/invite/center", proxy, headers=AH),
-                       "invite center").get("data") or {}
-            mr = (_json(http_get(f"{TEAM}/api/activity/invite/my-registration", proxy, headers=AH),
-                        "my-registration").get("data") or {})
-        except ProxyFailure as e:
-            # api.b.ai host terpisah; banyak proxy gratis memblokirnya. Info invite
-            # itu bonus — akun + API key jangan ikut gagal karenanya.
+            ic = team_get("/api/activity/invite/center", jwt).get("data") or {}
+            mr = team_get("/api/activity/invite/my-registration", jwt).get("data") or {}
+        except Exception as e:
+            # api.b.ai rate-limit per IP dan sering diblokir proxy gratis. Info
+            # invite itu bonus — akun + API key jangan ikut gagal karenanya.
             print(f"⚠️  info invite dilewati ({str(e)[:60]})")
             return out
         rr = mr.get("registration_reward") or {}
@@ -1038,7 +1137,8 @@ def _selftest_transfer():
     ongkos gas), dan tx yang DROP harus dianggap gagal (bukan sukses) — bug itu
     pernah bikin script melaporkan 'berhasil' padahal uangnya tidak pindah."""
     src, dst = Account.create(), Account.create()
-    state = {"bal": 10 ** 18, "raw": None, "mined": True, "sent": 0, "gas_rejected": False}
+    state = {"bal": 10 ** 18, "raw": None, "mined": True, "sent": 0,
+             "gas_rejected": False, "l1_fee": 0}
 
     def fake_rpc(url, method, params):
         if method == "eth_getBalance":
@@ -1049,6 +1149,10 @@ def _selftest_transfer():
             return hex(7)
         if method == "eth_chainId":
             return hex(56)
+        if method == "eth_getBlockByNumber":
+            return {}                       # legacy chain: tanpa baseFee
+        if method == "eth_call":
+            return hex(state["l1_fee"])     # oracle L1 fee (Base/OP)
         if method == "eth_sendRawTransaction":
             state["raw"] = params[0]
             state["sent"] += 1
@@ -1067,9 +1171,18 @@ def _selftest_transfer():
     globals()["rpc_call"] = fake_rpc
     try:
         res = chain_transfer_all("bnb", "http://mock", src.key.hex(), dst.address)
-        assert res and res["amount_wei"] == state["bal"] - int(TRANSFER_GAS * 3e9 * GAS_BUFFER), res
+        cost = int(TRANSFER_GAS * int(3e9 * GAS_BUFFER))   # gas * gasPrice(buffer)
+        assert res and res["amount_wei"] == state["bal"] - cost - cost // 50, res
         assert Account.recover_transaction(state["raw"]) == src.address, "tx bukan dari src"
         assert res["tx"], "txhash tidak tercatat"
+
+        # L1 data fee (Base/OP) WAJIB ikut dipotong: tanpa itu tx masuk mempool
+        # lalu tidak pernah mined (nonce naik, saldo diam).
+        state.update(sent=0, l1_fee=7 * 10 ** 9)
+        res_l1 = chain_transfer_all("bnb", "http://mock", src.key.hex(), dst.address)
+        cost_l1 = cost + state["l1_fee"]
+        assert res_l1 and res_l1["amount_wei"] == state["bal"] - cost_l1 - cost_l1 // 50, res_l1
+        state.update(l1_fee=0)
 
         # tx drop -> HARUS error (dulu dilaporkan sukses), dan dicoba ulang
         state.update(mined=False, sent=0)
@@ -1342,6 +1455,193 @@ def cmd_fund(cfg, dry_run=False):
         print("\n✅ semua saldo sudah pindah (terverifikasi masuk blok).")
 
 
+def _richest(cfg, wallets):
+    """(addr, key, chain, wei) wallet dengan saldo terbesar; None kalau semua kosong.
+    Dipakai --rescue: kalau funder kosong, uang yang nyangkut di akun lama tetap
+    bisa dipakai untuk membuka gate claim akun lain."""
+    best = None
+    for addr, key in wallets:
+        for chain in (cfg.get("chains") or ["base"]):
+            for u in (RPC_CHAINS.get(chain) or []):
+                try:
+                    b = int(rpc_call(u, "eth_getBalance", [addr, "latest"]), 16)
+                except Exception:
+                    continue
+                if b and (best is None or b > best[3]):
+                    best = (addr, key, chain, b)
+                break
+    return best
+
+
+def cmd_rescue(cfg, dry_run=False):
+    """Selamatkan bonus yang BELUM di-claim di akun yang sudah ada.
+
+    Kenapa perlu: run yang gagal funding bikin claim dilewati, padahal bonusnya
+    masih ada di server (terverifikasi: 49 akun masih eligible 1M). Gate claim
+    cuma butuh saldo non-zero, dan saldo itu dioper sebagai RANTAI (funder ->
+    akun A -> akun B -> … -> funder) seperti --fund biasa: satu aliran saldo,
+    jadi tidak ada dust yang nyangkut dan ongkos gasnya minimal.
+
+    Urutan tiap akun: saldo masuk -> claim 300K (REST, sekalian auto-1M) ->
+    claim 1M (tRPC) kalau REST tidak menyentuhnya. Idempoten: akun yang sudah
+    beres dilewati di run berikutnya.
+    """
+    funder = load_funder(cfg)
+    if not funder:
+        print("❌ isi 'funder_private_key' (atau 'funder_mnemonic') di config.json dulu"); return
+    accounts = load_accounts()
+    if not accounts:
+        print("belum ada akun di accounts.json"); return
+
+    # Scan server-side dulu: akun tanpa bonus tertinggal tidak perlu disalurkan
+    # saldo sama sekali (hemat gas + tidak buang token turnstile). Sekalian catat
+    # saldo tiap akun — akun yang sudah punya saldo non-zero TIDAK perlu dikirimi
+    # apa-apa (gate claim cuma cek non-zero; dust 3e-8 sudah lolos).
+    perlu, berisi = [], []
+    print("🔎 cek bonus yang belum di-claim (langsung, tanpa proxy) …")
+    for a in accounts:
+        if not a.get("private_key"):
+            continue
+        if not a.get("cookies"):
+            # Cookies hilang (run lama): login ulang pakai private key. Akun sudah
+            # terdaftar, jadi ini cuma masuk — tanpa invite, tanpa wallet baru.
+            try:
+                signer = Account.from_key("0x" + a["private_key"])
+                ck, reason = login(a["address"], signer, a.get("chain") or "eth",
+                                   a.get("provider") or "binance", None)
+                if not ck:
+                    print(f"  idx {a.get('index')}: login ulang gagal ({reason})"); continue
+                a["cookies"] = ck
+                append_account({"address": a["address"], "cookies": ck})   # jangan hilang lagi
+                print(f"  idx {a.get('index')}: cookies dipulihkan (login ulang)")
+            except Exception as e:
+                print(f"  idx {a.get('index')}: login ulang error ({type(e).__name__})"); continue
+        ck = "; ".join(f"{k}={v}" for k, v in a["cookies"].items())
+        try:
+            jwt = user_state(ck, None).get("apiAccessToken")
+            if not jwt:
+                continue
+            sb = signup_bonus_status(jwt, None)
+            mr = team_get("/api/activity/invite/my-registration", jwt).get("data") or {}
+        except Exception:
+            continue
+        rr = mr.get("registration_reward") or {}
+        c1 = bool(sb.get("claimable") and not sb.get("claimed"))
+        c3 = bool(rr.get("claimable") and not rr.get("claimed"))
+        if not (c1 or c3):
+            continue
+        a["_jwt"] = jwt
+        if _richest(cfg, [(a["address"], a["private_key"])]):
+            berisi.append(a)
+            print(f"  idx {a.get('index'):>3}: {'1M ' if c1 else ''}{'300K' if c3 else ''}"
+                  f"({a['address'][:10]}…) — sudah ada saldo")
+        else:
+            perlu.append(a)
+            print(f"  idx {a.get('index'):>3}: {'1M ' if c1 else ''}{'300K' if c3 else ''}"
+                  f"({a['address'][:10]}…) — butuh saldo")
+    if not perlu and not berisi:
+        print("\n✅ tidak ada bonus yang tertinggal — semua sudah di-claim."); return
+    print(f"\n{len(berisi)} akun siap claim (sudah bersaldo), {len(perlu)} butuh saldo dulu")
+
+    def claim_satu(a):
+        """Claim 300K dulu (paling rapuh: butuh invite), lalu 1M kalau REST belum
+        menyentuhnya. Return (ok1, ok3, points)."""
+        signer = Account.from_key("0x" + a["private_key"])
+        ck = "; ".join(f"{k}={v}" for k, v in a["cookies"].items())
+        sb = signup_bonus_status(a["_jwt"], None)
+        mr = team_get("/api/activity/invite/my-registration", a["_jwt"]).get("data") or {}
+        rr = mr.get("registration_reward") or {}
+        ok3 = False
+        if rr.get("claimable") and not rr.get("claimed"):
+            ok3 = claim_registration_reward(a["_jwt"], ck, a["address"], signer, "eth", None)
+        sb = signup_bonus_status(a["_jwt"], None)   # REST kadang sekalian auto-claim 1M
+        if sb.get("claimable") and not sb.get("claimed"):
+            ok1 = claim_signup_bonus(ck, a["address"], signer, "eth", None, a["_jwt"])
+        else:
+            ok1 = bool(sb.get("claimed"))
+            if ok1:
+                print("ℹ️ 1M: sudah di-claim (ikut 300K)")
+        st = full_status(ck, None, quiet=True) or {}
+        return ok1, ok3, st.get("points")
+
+    def simpan(a, ok1, ok3, pts):
+        """Catat hasil ke accounts.json — kalau tidak, run berikutnya mengulang
+        akun yang sudah beres dan status di file tetap 0. Status claim TIDAK
+        diturunkan ke False (merge dengan nilai lama)."""
+        rec = {"address": a["address"], "cookies": a["cookies"]}
+        if pts is not None:
+            rec["points"] = pts
+        if ok1 or a.get("signup_bonus_claimed"):
+            rec["signup_bonus_claimed"] = True
+        if ok3 or a.get("registration_reward_claimed"):
+            rec["registration_reward_claimed"] = True
+        append_account(rec)
+
+    beres, gagal = [], []
+
+    # Jalur 1: akun yang sudah bersaldo — langsung claim, tidak ada tx sama sekali.
+    for n, a in enumerate(berisi, 1):
+        print(f"\n=== rescue {n}/{len(berisi)} (saldo sudah ada) — idx {a.get('index')} ===")
+        if dry_run:
+            print("  (dry-run: claim dilewati)"); continue
+        try:
+            ok1, ok3, pts = claim_satu(a)
+            simpan(a, ok1, ok3, pts)
+            print(f"  {'✅' if (ok1 or ok3) else '⚠️ '} idx {a.get('index')}: "
+                  f"1M={ok1} 300K={ok3} | points {pts}")
+            (beres if (ok1 or ok3) else gagal).append(a.get("index"))
+        except Exception as e:
+            print(f"  ! error: {type(e).__name__}: {str(e)[:140]}")
+            gagal.append(a.get("index"))
+        time.sleep(1)
+
+    # Jalur 2: sisanya butuh saldo. Dioper sebagai RANTAI (funder -> A -> B -> …),
+    # jadi satu aliran saldo saja — tidak ada dust nyangkut, gas minimal.
+    if perlu:
+        src_addr, src_key = funder.address, funder.key.hex()
+        # Funder kosong tapi ada akun lama yang masih menyimpan saldo (sisa run
+        # gagal)? Mulai rantai dari akun terkaya itu, jangan berhenti karena debu.
+        wallet_pool = [(funder.address, funder.key.hex())] + \
+                      [(a["address"], a["private_key"]) for a in accounts if a.get("private_key")]
+        start = _richest(cfg, wallet_pool)
+        if start and start[0].lower() != funder.address.lower():
+            print(f"\n💡 funder kosong — rantai mulai dari akun terkaya "
+                  f"{start[0][:10]}… ({start[3] / 1e18:.10f} {start[2]})")
+            src_addr, src_key = start[0], start[1]
+        last_holder = None
+        for n, a in enumerate(perlu, 1):
+            print(f"\n=== rescue {n}/{len(perlu)} (butuh saldo) — idx {a.get('index')} ===")
+            try:
+                print(f"  💰 saldo {src_addr[:10]}… -> {a['address'][:10]}…")
+                moved, _ = move_all_funds(cfg, src_key, a["address"], dry_run)
+                if not moved and not dry_run:
+                    print("  ! saldo tidak masuk — akun dilewati"); gagal.append(a.get("index")); continue
+                src_addr, src_key = a["address"], a["private_key"]   # saldo kini di sini
+                last_holder = a
+                if dry_run:
+                    print("  (dry-run: claim dilewati)"); continue
+                ok1, ok3, pts = claim_satu(a)
+                simpan(a, ok1, ok3, pts)
+                print(f"  {'✅' if (ok1 or ok3) else '⚠️ '} idx {a.get('index')}: "
+                      f"1M={ok1} 300K={ok3} | points {pts}")
+                (beres if (ok1 or ok3) else gagal).append(a.get("index"))
+            except Exception as e:
+                print(f"  ! error: {type(e).__name__}: {str(e)[:140]}")
+                gagal.append(a.get("index"))
+            time.sleep(1)
+        if last_holder and not dry_run:
+            print(f"\n💰 sisa saldo idx {last_holder.get('index')} -> funder …")
+            _, sisa_gagal = move_all_funds(cfg, "0x" + last_holder["private_key"], funder.address)
+            if sisa_gagal:
+                print(f"  ⚠️  belum balik di {sisa_gagal} — jalankan 'python bai.py --fund' lagi")
+
+    print(f"\n=== rescue selesai: {len(beres)} berhasil, gagal {len(gagal) or '-'} ===")
+    if beres:
+        print(f"    berhasil: {beres}")
+    if gagal:
+        print(f"    gagal   : {gagal} — jalankan lagi 'python bai.py --rescue' (idempoten)")
+
+
 def load_funder(cfg):
     """Funder dari config: private key 64-hex ATAU mnemonic 12/24 kata.
 
@@ -1391,6 +1691,8 @@ def main():
     ap.add_argument("--fund", action="store_true",
                     help="jalankan rantai saldo funder->akun1->…->funder atas akun yang ada")
     ap.add_argument("--dry-run", action="store_true", help="dengan --fund: cuma hitung, tak kirim")
+    ap.add_argument("--rescue", action="store_true",
+                    help="tarik bonus yang belum di-claim di akun lama (rantai saldo + claim, idempoten)")
     ap.add_argument("--status", action="store_true", help="status dari session_full.json")
     args = ap.parse_args()
 
@@ -1405,6 +1707,8 @@ def main():
 
     if args.fund:
         return cmd_fund(cfg, args.dry_run)
+    if args.rescue:
+        return cmd_rescue(cfg, args.dry_run)
     if args.finish:
         return cmd_finish(cfg, chain, apikey_name, args.claim)
 
