@@ -1798,8 +1798,74 @@ def _tanya_pilihan(prompt, pilihan, default):
         print(f"  ❌ pilih salah satu: {', '.join(pilihan)}")
 
 
+# Coin id CoinGecko per chain. Base & OP bayar gas pakai ETH.
+COINGECKO_ID = {"bnb": "binancecoin", "eth": "ethereum", "pol": "matic-network",
+                "base": "ethereum", "arb": "arbitrum", "op": "ethereum"}
+_HARGA_CACHE = [0.0, 0.0]   # [harga, diambil_pada_epoch]
+
+
+def _harga_usd(chains):
+    """Harga USD per chain (dict chain->usd), cache 10 menit. Gagal = 0 (deteksi
+    dolar dilewati, saldo tetap tampil native)."""
+    now = time.time()
+    if _HARGA_CACHE[0] and now - _HARGA_CACHE[1] < 600:
+        return {c: _HARGA_CACHE[0] for c in chains if c in COINGECKO_ID}
+    ids = sorted({COINGECKO_ID[c] for c in chains if c in COINGECKO_ID})
+    if not ids:
+        return {}
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price",
+                         params={"ids": ",".join(ids), "vs_currencies": "usd"}, timeout=8)
+        data = r.json() or {}
+    except Exception:
+        return {}
+    out = {}
+    for c in chains:
+        cid = COINGECKO_ID.get(c)
+        if cid and data.get(cid, {}).get("usd"):
+            out[c] = float(data[cid]["usd"])
+    if out:
+        _HARGA_CACHE[0] = sum(out.values()) / len(out)   # cache pertama utk cepat
+        _HARGA_CACHE[1] = now
+    return out
+
+
+def saldo_semua_chain(addr, chains=None):
+    """Saldo native `addr` di setiap chain: {chain: wei}. Chain gagal = dilewati."""
+    out = {}
+    for c in (chains or list(RPC_CHAINS)):
+        for u in (RPC_CHAINS.get(c) or []):
+            try:
+                out[c] = int(rpc_call(u, "eth_getBalance", [addr, "latest"]), 16)
+                break
+            except Exception:
+                continue
+    return out
+
+
+def _tampilkan_saldo_usd(funder_addr, chains=None):
+    """Saldo funder di semua chain + nilai $-nya. Return dict chain->wei."""
+    sal = saldo_semua_chain(funder_addr, chains)
+    if not sal:
+        print("💰 funder: semua chain kosong / RPC gagal")
+        return sal
+    harga = _harga_usd(list(sal))
+    print("💰 saldo funder di semua chain:")
+    total_usd = 0.0
+    for c, wei in sal.items():
+        h = harga.get(c)
+        native = wei / 1e18
+        usd = native * h if h else None
+        total_usd += usd or 0.0
+        ket = f"= ${usd:,.4f}" if usd is not None else "(harga tidak terbaca)"
+        print(f"   {c:5s} {native:.12f}  {ket}")
+    if total_usd:
+        print(f"   total ≈ ${total_usd:,.4f}")
+    return sal
+
+
 def _status_ringkas():
-    """Ringkasan keadaan sekarang: akun, points, funder, solver."""
+    """Ringkasan keadaan sekarang: akun, points, funder (semua chain, $), solver."""
     akun = load_accounts()
     pts = sum(a.get("points") or 0 for a in akun)
     beres = len([a for a in akun if a.get("points")])
@@ -1807,14 +1873,7 @@ def _status_ringkas():
     cfg = load_config()
     funder = load_funder(cfg)
     if funder:
-        for c in (cfg.get("chains") or ["base"]):
-            for u in (RPC_CHAINS.get(c) or []):
-                try:
-                    b = int(rpc_call(u, "eth_getBalance", [funder.address, "latest"]), 16)
-                    print(f"💰 funder {c}: {b / 1e18:.10f}")
-                    break
-                except Exception:
-                    continue
+        _tampilkan_saldo_usd(funder.address)
     try:
         requests.get(f"{BOTERDROP}/turnstile", params={"url": BASE + "/chat",
                      "sitekey": TURNSTILE_SITEKEY}, timeout=3)
@@ -1851,7 +1910,21 @@ def menu_interaktif():
 
     # ---- pilihan 1: bikin akun ----
     print()
-    chain = _tanya_pilihan("chain (tempat saldo funder)", tuple(RPC_CHAINS), "base")
+    # Deteksi otomatis: chain disarankan dari saldo funder terbesar ($).
+    cfg = load_config()
+    funder = load_funder(cfg)
+    sal = saldo_semua_chain(funder.address) if funder else {}
+    harga = _harga_usd(list(sal)) if sal else {}
+    berisi = {c: w for c, w in sal.items() if w > 0}
+    if not berisi:
+        print("⚠️  saldo funder kosong di semua chain — deposit dulu")
+        chain_default = "base"
+    elif len(berisi) == 1:
+        chain_default = next(iter(berisi))
+    else:
+        # terbanyak menurut nilai $
+        chain_default = max(berisi, key=lambda c: (berisi[c] / 1e18) * harga.get(c, 0))
+    chain = _tanya_pilihan("chain (tempat saldo funder)", tuple(RPC_CHAINS), chain_default)
     count = _tanya_int("jumlah akun", 10, 1, 100000)
     parallel = _tanya_int("concurrent (berapa proxy dicoba paralel per akun)", 6, 1, 50)
     workers = _tanya_int("batas thread", 8, 1, 64)
