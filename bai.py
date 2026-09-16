@@ -49,6 +49,18 @@ from mnemonic import Mnemonic
 
 from proxypool import ProxyPool, ProxyUnavailable, ProxyFailure, attempt_with_rotation
 
+
+class WalletRetry(RuntimeError):
+    """Login gagal tapi wallet-nya sudah tersimpan. Membawa wallet itu supaya
+    percobaan berikutnya memakai wallet yang SAMA — dulu tiap rotasi proxy bikin
+    wallet baru, jadi satu akun bisa meninggalkan 5 wallet sampah di wallet.txt."""
+
+    def __init__(self, message, addr, signer, mnemonic):
+        super().__init__(message)
+        self.addr, self.signer, self.mnemonic = addr, signer, mnemonic
+        self.part = {"address": addr, "signer": signer, "mnemonic": mnemonic,
+                     "provider": None, "chain": None}
+
 sys.stdout.reconfigure(encoding="utf-8")
 Account.enable_unaudited_hdwallet_features()
 
@@ -634,14 +646,23 @@ def new_wallet_saved(chain, invite=None):
     return addr, signer, mn
 
 
-def signup_one(chain, provider, invite, proxy):
-    """FASE 1 — bikin akun di server (wallet + login) lewat SATU proxy."""
-    addr, signer, mn = new_wallet_saved(chain, invite)
+def signup_one(chain, provider, invite, proxy, part=None):
+    """FASE 1 — bikin akun di server (wallet + login) lewat SATU proxy.
+
+    `part` boleh diisi dari percobaan sebelumnya: rotasi proxy TIDAK boleh bikin
+    wallet baru tiap kali (dulu begitu — satu akun meninggalkan 5 wallet sampah).
+    """
+    if part is None:
+        addr, signer, mn = new_wallet_saved(chain, invite)
+    else:
+        addr, signer, mn = part["address"], part["signer"], part["mnemonic"]
     cookies, reason = login(addr, signer, chain, provider, proxy, invite)
     if not cookies:
         if reason == "ratelimit":
             raise ProxyFailure(f"IP ditandai server (ratelimit): {proxy}", "http_status")
-        raise RuntimeError(f"login gagal ({reason})")
+        # Wallet-nya sudah tersimpan: bawa serta supaya percobaan berikutnya pakai
+        # wallet yang sama, bukan bikin yang baru.
+        raise WalletRetry(f"login gagal ({reason})", addr, signer, mn)
     return {"address": addr, "signer": signer, "mnemonic": mn, "cookies": cookies,
             "provider": provider, "chain": chain, "wallet_saved": True}
 
@@ -831,39 +852,49 @@ def basic_config_ts(proxy):
 
 def login(addr, signer, chain, provider, proxy, invite=None):
     """NextAuth: GET csrf + POST callback (satu Session). Return (cookies, reason).
-    reason: None=sukses, 'ratelimit'=error=Configuration (per-IP), 'auth'=error lain,
-    'turnstile'=token gagal, 'csrf'=csrf gagal, 'proxy'=proxy mati (memicu rotasi)."""
-    tt = get_turnstile_token()
-    if not tt:
-        return None, "turnstile"
-    sess = requests.Session()
-    sess.trust_env = False  # jangan biarkan proxy env/registry membelokkan request
-    sess.proxies.update(proxy_dict(proxy))
-    try:
-        csrf = _json(sess.get(BASE + "/api/auth/csrf", headers=headers(), timeout=30),
-                     "csrf").get("csrfToken", "")
-    except requests.RequestException as e:
-        raise ProxyFailure(f"{type(e).__name__}: {e}") from e
-    if not csrf:
-        print("❌ csrf gagal"); return None, "csrf"
-    msg = welcome_msg(addr, chain, basic_config_ts(proxy))
-    form = {"chain": chain, "message": msg, "signature": sign(signer, msg, chain),
-            "turnstileToken": tt, "version": "solana" if chain == "solana" else "2",
-            "csrfToken": csrf, "callbackUrl": BASE + "/chat"}
-    if invite:
-        form["invite_code"] = invite.upper()  # modul 144534
-    try:
-        r = sess.post(f"{BASE}/api/auth/callback/{provider}", data=form,
-                      headers=headers({"content-type": "application/x-www-form-urlencoded",
-                                       "x-auth-return-redirect": "1"}), timeout=60)
-    except requests.RequestException as e:
-        raise ProxyFailure(f"{type(e).__name__}: {e}") from e
-    url = _json(r, "login callback").get("url", "?")
-    if "error" in url:
+
+    reason: None=sukses, 'ratelimit'=error=Configuration (per-IP, ganti proxy),
+    'turnstile'=token ditolak (token baru bisa menyelesaikan), 'auth'=error lain,
+    'csrf'=csrf gagal, 'proxy'=proxy mati (memicu rotasi).
+    """
+    # Turnstile token sekali pakai dan kadang ditolak server. Diulang dengan token
+    # BARU sebelum menyerah: satu token jelek tidak boleh membuang akun.
+    for attempt in range(3):
+        tt = get_turnstile_token()
+        if not tt:
+            return None, "turnstile"
+        sess = requests.Session()
+        sess.trust_env = False  # jangan biarkan proxy env/registry membelokkan request
+        sess.proxies.update(proxy_dict(proxy))
+        try:
+            csrf = _json(sess.get(BASE + "/api/auth/csrf", headers=headers(), timeout=30),
+                         "csrf").get("csrfToken", "")
+        except requests.RequestException as e:
+            raise ProxyFailure(f"{type(e).__name__}: {e}") from e
+        if not csrf:
+            print("❌ csrf gagal"); return None, "csrf"
+        msg = welcome_msg(addr, chain, basic_config_ts(proxy))
+        form = {"chain": chain, "message": msg, "signature": sign(signer, msg, chain),
+                "turnstileToken": tt, "version": "solana" if chain == "solana" else "2",
+                "csrfToken": csrf, "callbackUrl": BASE + "/chat"}
+        if invite:
+            form["invite_code"] = invite.upper()  # modul 144534
+        try:
+            r = sess.post(f"{BASE}/api/auth/callback/{provider}", data=form,
+                          headers=headers({"content-type": "application/x-www-form-urlencoded",
+                                           "x-auth-return-redirect": "1"}), timeout=60)
+        except requests.RequestException as e:
+            raise ProxyFailure(f"{type(e).__name__}: {e}") from e
+        url = _json(r, "login callback").get("url", "?")
+        if "error" not in url:
+            print(f"✅ login ok ({provider})")
+            return {c.name: c.value for c in r.cookies}, None
         print(f"❌ login: {url}")
-        return None, ("ratelimit" if "Configuration" in url else "auth")
-    print(f"✅ login ok ({provider})")
-    return {c.name: c.value for c in r.cookies}, None
+        if "Configuration" in url:
+            return None, "ratelimit"       # IP ditandai; proxy lain yang menolong
+        if attempt < 2:
+            print(f"  ↻ ulangi login dengan turnstile baru ({attempt + 1}/2)")
+    return None, "auth"
 
 
 def trpc_get(proc, ck, proxy, input_obj=None):
@@ -1111,6 +1142,43 @@ def selftest():
     assert os.path.isfile(os.path.join(BASE_DIR, "proxypool.py")), "proxypool.py tidak ada"
     _selftest_funder()
     _selftest_transfer()
+    _selftest_wallet_reuse()
+
+
+def _selftest_wallet_reuse():
+    """Rotasi proxy TIDAK boleh bikin wallet baru: dulu tiap percobaan gagal
+    meninggalkan satu wallet sampah di wallet.txt (satu akun bisa jadi 5)."""
+    part = {"address": "0x" + "22" * 20, "signer": Account.from_key("0x" + "33" * 32),
+            "mnemonic": "test test test test test test test test test test test junk"}
+    real = globals()["login"]
+    try:
+        # 1. login gagal -> WalletRetry yang MEMBAWA wallet (bukan bikin baru)
+        globals()["login"] = lambda *a, **k: (None, "auth")
+        try:
+            signup_one("eth", "binance", None, "http://px", part)
+            raise AssertionError("login gagal harus melempar WalletRetry")
+        except WalletRetry as e:
+            assert e.part["address"] == part["address"], "wallet harus sama"
+            assert e.part["signer"] is part["signer"], "signer harus sama"
+        # 2. dengan `part`, wallet TIDAK dibuat ulang (new_wallet tidak dipanggil)
+        made = []
+        real_new = globals()["new_wallet_saved"]
+        globals()["new_wallet_saved"] = lambda *a, **k: (
+            made.append(1), ("0x" + "44" * 20, part["signer"], part["mnemonic"]))[1]
+        globals()["login"] = lambda *a, **k: ({"c": "v"}, None)
+        try:
+            res = signup_one("eth", "binance", None, "http://px", part)
+            assert not made, "wallet baru dibuat padahal `part` sudah ada"
+            assert res["address"] == part["address"], res
+            # 3. tanpa `part`, wallet baru memang harus dibuat
+            res2 = signup_one("eth", "binance", None, "http://px")
+            assert made, "wallet baru harus dibuat kalau `part` kosong"
+            assert res2["address"] != part["address"], res2
+        finally:
+            globals()["new_wallet_saved"] = real_new
+    finally:
+        globals()["login"] = real
+    print("✅ selftest wallet-reuse OK")
 
 
 def _selftest_funder():
@@ -1249,19 +1317,42 @@ def run_batch(cfg, count, chain, provider, apikey_name, do_claim, do_bind, direc
         return proxy
 
     def with_rotation(step, tries=None):
-        """Jalankan step(proxy) dengan rotasi proxy saat proxinya yang rusak."""
+        """Jalankan step(proxy) dengan rotasi proxy saat proxinya yang rusak.
+
+        Return (hasil, proxy) — hasil None kalau semua percobaan gagal. Exception
+        non-proxy (mis. login ditolak server) TIDAK dilempar keluar: satu akun
+        gagal jangan mematikan seluruh batch. Percobaan berikutnya otomatis pakai
+        proxy lain, jadi error sesaat tidak menghukum akun itu.
+        """
         nonlocal proxy, used
         # tanpa pool tidak ada yang bisa dirotasi — sekali coba saja
         tries = 1 if pool is None else (tries or int(cfg.get("proxy_attempts", 5)))
+        last_err = None
+        carry = None       # wallet dari percobaan sebelumnya (jangan bikin baru)
         for _ in range(tries):
             px = pick_proxy()
             try:
-                return step(px), px
+                return step(px, carry), px
+            except WalletRetry as e:
+                # Wallet sudah tersimpan tapi login ditolak: pakai lagi di
+                # percobaan berikutnya dengan proxy berbeda.
+                carry = e.part
+                last_err = e
+                print(f"  ! {e} — coba proxy lain (wallet tetap sama)")
+                used = per_proxy
             except ProxyFailure as e:
                 print(f"  ! proxy gagal ({e.reason}): {str(e)[:120]}")
                 if pool is not None:
                     pool.drop(px, e.reason)
                 used = per_proxy  # paksa ambil proxy baru di percobaan berikutnya
+            except Exception as e:
+                # Server menolak (ratelimit/turnstile) atau error lain: coba
+                # lagi dengan proxy berbeda, jangan hentikan run.
+                last_err = e
+                print(f"  ! {type(e).__name__}: {str(e)[:110]} — coba proxy lain")
+                used = per_proxy
+        if last_err:
+            print(f"  ! menyerah setelah {tries} percobaan ({str(last_err)[:80]})")
         return None, None
 
     # Laporan saldo funder SEBELUM mulai: tanpa ini, saldo yang tinggal debu bikin
@@ -1284,73 +1375,89 @@ def run_batch(cfg, count, chain, provider, apikey_name, do_claim, do_bind, direc
     for i in range(1, count + 1):
         print(f"\n=== akun {i}/{count} (invite: {invite or '-'}) ===")
         cfg["invite"] = invite
-        rec = None
-
-        # FASE 1: bikin akun. Gagal di sini = belum ada akun, aman diulang.
-        if pool is not None and parallel > 1:
-            part, proxy_used = signup_parallel(chain, provider, invite, pool,
-                                               parallel, workers)
-            if not part:
-                print("  ! akun gagal dibuat, lewati")
-                failed.append(i)
-                continue
-        else:
-            part, proxy_used = with_rotation(
-                lambda px: signup_one(chain, provider, invite, px))
-            if not part:
-                print("  ! akun gagal dibuat, lewati")
-                failed.append(i)
-                continue
-
-        used += 1
-        # FASE 1.5: saldo masuk dulu (kalau ada funder) — gate klaim butuh balance.
-        # Sumbernya wallet akun sebelumnya, jadi yang dioper PRIVATE KEY-nya, bukan alamat.
-        claim_akun_ini = do_claim
-        if funder and chain != "solana":
-            if made and made[-1].get("private_key"):
-                src_key = "0x" + made[-1]["private_key"]
-                src_addr = made[-1]["address"]
+        # Seluruh badan loop dibungkus try: satu akun error (server nolak, RPC mati,
+        # bug tak terduga) jangan mematikan seluruh batch — run 1000 akun tidak
+        # boleh berhenti karena 1 akun bermasalah.
+        try:
+            # FASE 1: bikin akun. Gagal di sini = belum ada akun, aman diulang.
+            if pool is not None and parallel > 1:
+                part, proxy_used = signup_parallel(chain, provider, invite, pool,
+                                                   parallel, workers)
+                if not part:
+                    print("  ! akun gagal dibuat, lewati")
+                    failed.append(i)
+                    continue
             else:
-                src_key, src_addr = funder.key.hex(), funder.address
-            print(f"💰 saldo {src_addr[:10]}… -> {part['address'][:10]}…")
-            moved, gagal = move_all_funds(cfg, src_key, part["address"])
-            part["funding"] = moved
-            if not moved:
-                # Tidak ada saldo yang pindah: gate klaim PASTI menolak ("do not hold
-                # any native tokens"), jadi jangan buang token turnstile. Akun tetap
-                # dibuat + disimpan, klaim bisa diulang lewat --finish nanti.
-                print("  ⚠️  tidak ada saldo yang masuk — claim dilewati untuk akun ini")
-                print("     (isi saldo funder, lalu jalankan: python bai.py --finish --claim)")
-                claim_akun_ini = False
-            elif gagal:
-                print(f"  ⚠️  sebagian gagal di {gagal} — klaim mungkin ditolak, "
-                      f"bisa diulang dengan --finish")
+                part, proxy_used = with_rotation(
+                    lambda px, carry: signup_one(chain, provider, invite, px, carry))
+                if not part:
+                    print("  ! akun gagal dibuat, lewati")
+                    failed.append(i)
+                    continue
 
-        # FASE 2: akun sudah ada — pakai proxy lain kalau perlu, jangan sampai hilang.
-        def do_finish(px):
-            part["proxy_created"] = proxy_used
-            return finish_account(cfg, part, px, apikey_name, claim_akun_ini)
+            used += 1
+            # Simpan record MINIMAL sekarang juga: wallet-nya sudah ada (dan mungkin
+            # sudah dikirimi saldo di FASE 1.5), jadi kalau Ctrl+C / mati listrik di
+            # tengah jalan, akun ini tetap tercatat di accounts.json — bukan cuma di
+            # wallet.txt. FASE 2 menimpa record ini dengan data lengkap.
+            append_account({"address": part["address"], "chain": chain,
+                            "provider": provider, "created_at": int(time.time()),
+                            "invite_used": invite, "status": "created",
+                            "cookies": part.get("cookies"),
+                            "private_key": part["signer"].key.hex() if chain != "solana" else None})
 
-        rec, proxy_final = with_rotation(do_finish)
-        if not rec:
-            # Akun tetap disimpan walau fase 2 gagal — termasuk API key yang mungkin
-            # sudah didapat sebelum proxy mati (kalau tidak, key itu hilang tak tercatat).
-            rec = {"address": part["address"], "chain": chain, "provider": provider,
-                   "created_at": int(time.time()), "proxy": proxy_used,
-                   "invite_used": invite, "status": "partial",
-                   "note": "login sukses, apikey/status gagal (proxy mati)",
-                   "cookies": part["cookies"], "api_key": part.get("api_key"),
-                   "funding": part.get("funding"),
-                   "private_key": part["signer"].key.hex() if chain != "solana" else None}
+            # FASE 1.5: saldo masuk dulu (kalau ada funder) — gate klaim butuh balance.
+            # Sumbernya wallet akun sebelumnya, jadi yang dioper PRIVATE KEY-nya.
+            claim_akun_ini = do_claim
+            if funder and chain != "solana":
+                if made and made[-1].get("private_key"):
+                    src_key = "0x" + made[-1]["private_key"]
+                    src_addr = made[-1]["address"]
+                else:
+                    src_key, src_addr = funder.key.hex(), funder.address
+                print(f"💰 saldo {src_addr[:10]}… -> {part['address'][:10]}…")
+                moved, gagal = move_all_funds(cfg, src_key, part["address"])
+                part["funding"] = moved
+                if not moved:
+                    # Tidak ada saldo yang pindah: gate klaim PASTI menolak ("do not
+                    # hold any native tokens"), jadi jangan buang token turnstile.
+                    # Akun tetap dibuat + disimpan, klaim diulang lewat --rescue.
+                    print("  ⚠️  tidak ada saldo yang masuk — claim dilewati untuk akun ini")
+                    print("     (isi saldo funder, lalu jalankan: python bai.py --rescue)")
+                    claim_akun_ini = False
+                elif gagal:
+                    print(f"  ⚠️  sebagian gagal di {gagal} — klaim mungkin ditolak, "
+                          f"bisa diulang dengan --rescue")
 
-        total = append_account(rec)
-        made.append(rec)
-        if do_bind and rec.get("invite_code"):
-            invite = rec["invite_code"]
-            print(f"🎟️  invite akun ini utk akun berikutnya: {invite}")
-        print(f"💾 tersimpan: {total} akun ber-apikey di {os.path.basename(ACCOUNTS_FILE)}"
-              f" + {os.path.basename(APIKEY_FILE)}")
+            # FASE 2: akun sudah ada — pakai proxy lain kalau perlu, jangan sampai hilang.
+            def do_finish(px, carry=None):
+                part["proxy_created"] = proxy_used
+                return finish_account(cfg, part, px, apikey_name, claim_akun_ini)
 
+            rec, proxy_final = with_rotation(do_finish)
+            if not rec:
+                # Akun tetap disimpan walau fase 2 gagal — termasuk API key yang
+                # mungkin sudah didapat sebelum proxy mati (kalau tidak, key hilang).
+                rec = {"address": part["address"], "chain": chain, "provider": provider,
+                       "created_at": int(time.time()), "proxy": proxy_used,
+                       "invite_used": invite, "status": "partial",
+                       "note": "login sukses, apikey/status gagal (proxy mati)",
+                       "cookies": part["cookies"], "api_key": part.get("api_key"),
+                       "funding": part.get("funding"),
+                       "private_key": part["signer"].key.hex() if chain != "solana" else None}
+
+            total = append_account(rec)
+            made.append(rec)
+            if do_bind and rec.get("invite_code"):
+                invite = rec["invite_code"]
+                print(f"🎟️  invite akun ini utk akun berikutnya: {invite}")
+            print(f"💾 tersimpan: {total} akun ber-apikey di {os.path.basename(ACCOUNTS_FILE)}"
+                  f" + {os.path.basename(APIKEY_FILE)}")
+        except KeyboardInterrupt:
+            raise                      # Ctrl+C harus tetap menghentikan
+        except Exception as e:
+            print(f"  ! akun {i} dilewati: {type(e).__name__}: {str(e)[:140]}")
+            failed.append(i)
         if i < count:
             time.sleep(float(cfg.get("delay_between_accounts", 3)))
 
@@ -1732,4 +1839,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl+C: yang sudah dikerjakan sudah tersimpan di accounts.json/wallet.txt
+        # (record ditulis sebelum funding, wallet ditulis sebelum login). Jangan
+        # telan sinyalnya tanpa pesan — user perlu tahu ke mana melanjutkan.
+        print("\n\n⛔ dihentikan (Ctrl+C). Akun yang sudah jadi tetap tersimpan di "
+              "accounts.json + wallet.txt.")
+        print("   lanjutkan dengan: python bai.py --rescue   (tarik bonus yang belum ke-claim)")
+        print("   atau            : python bai.py --fund     (tarik sisa saldo ke funder)")
+        sys.exit(130)
