@@ -1772,8 +1772,102 @@ def load_funder(cfg):
 
 
 # ==== MAIN ====
+def _tanya_int(prompt, default, minv=1, maxv=100000):
+    """Minta angka dari user; Enter = default. Ulangi sampai valid."""
+    while True:
+        raw = input(f"{prompt} [{default}]: ").strip()
+        if not raw:
+            return default
+        try:
+            v = int(raw)
+            if minv <= v <= maxv:
+                return v
+        except ValueError:
+            pass
+        print(f"  ❌ masukkan angka {minv}-{maxv}")
+
+
+def _tanya_pilihan(prompt, pilihan, default):
+    """Minta satu dari daftar pilihan; Enter = default. Return nilainya."""
+    while True:
+        raw = input(f"{prompt} [{'/'.join(pilihan)}] [{default}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in pilihan:
+            return raw
+        print(f"  ❌ pilih salah satu: {', '.join(pilihan)}")
+
+
+def _status_ringkas():
+    """Ringkasan keadaan sekarang: akun, points, funder, solver."""
+    akun = load_accounts()
+    pts = sum(a.get("points") or 0 for a in akun)
+    beres = len([a for a in akun if a.get("points")])
+    print(f"📊 akun: {len(akun)} (beres {beres}) | total points: {pts:,}")
+    cfg = load_config()
+    funder = load_funder(cfg)
+    if funder:
+        for c in (cfg.get("chains") or ["base"]):
+            for u in (RPC_CHAINS.get(c) or []):
+                try:
+                    b = int(rpc_call(u, "eth_getBalance", [funder.address, "latest"]), 16)
+                    print(f"💰 funder {c}: {b / 1e18:.10f}")
+                    break
+                except Exception:
+                    continue
+    try:
+        requests.get(f"{BOTERDROP}/turnstile", params={"url": BASE + "/chat",
+                     "sitekey": TURNSTILE_SITEKEY}, timeout=3)
+        print("🔓 solver Boterdrop: jalan ✅")
+    except Exception:
+        print("🔒 solver Boterdrop: TIDAK JALAN ❌  (start dulu: python api_server.py di folder Boterdrop-Solver)")
+
+
+def menu_interaktif():
+    """Jalan tanpa argumen: tanya semua setting di dalam script."""
+    print("=" * 46)
+    print("  BAI auto-register — menu")
+    print("=" * 46)
+    _status_ringkas()
+    print()
+    print("Mau apa?")
+    print("  1. Bikin akun baru + claim (alur utama)")
+    print("  2. Rescue   — tarik bonus yang belum ke-claim di akun lama")
+    print("  3. Fund     — tarik sisa saldo balik ke funder")
+    print("  4. Finish   — lengkapi akun yang setengah jadi")
+    print("  5. Keluar")
+    pilih = input("pilih [1-5]: ").strip() or "1"
+
+    cfg = load_config()
+    if pilih == "2":
+        return cmd_rescue(cfg, False)
+    if pilih == "3":
+        dr = input("dry-run dulu? [y/N]: ").strip().lower() == "y"
+        return cmd_fund(cfg, dr)
+    if pilih == "4":
+        return cmd_finish(cfg, "eth", "hermes", True)
+    if pilih == "5":
+        return
+
+    # ---- pilihan 1: bikin akun ----
+    print()
+    count = _tanya_int("jumlah akun", 10, 1, 100000)
+    parallel = _tanya_int("concurrent (berapa proxy dicoba paralel per akun)", 6, 1, 50)
+    workers = _tanya_int("batas thread", 8, 1, 64)
+    claim = _tanya_pilihan("claim bonus 1M+300K?", ("y", "n"), "y") == "y"
+    print()
+    print(f"rekap: {count} akun | concurrent {parallel} | thread {workers} | "
+          f"claim {'ya' if claim else 'tidak'}")
+    if input("lanjut? [Y/n]: ").strip().lower() == "n":
+        return
+    return run_batch(cfg, count, "eth", "binance", "hermes", claim,
+                     True, direct=False, forced_proxy=cfg.get("proxy"),
+                     parallel=max(1, parallel), workers=max(1, workers))
+
+
 def main():
-    ap = argparse.ArgumentParser(description="BAI auto-register (full HTTP, lewat proxy pool)")
+    ap = argparse.ArgumentParser(
+        description="BAI auto-register (tanpa argumen = menu interaktif)")
     ap.add_argument("-n", "--count", type=int, default=1, help="jumlah akun (default 1)")
     ap.add_argument("--solana", action="store_true", help="pakai wallet solana (phantom)")
     ap.add_argument("--provider", default="binance",
@@ -1805,6 +1899,10 @@ def main():
 
     if args.selftest:
         return selftest()
+
+    # Tanpa argumen apa pun -> menu interaktif (setting ditanya di dalam script).
+    if len(sys.argv) == 1:
+        return menu_interaktif()
 
     cfg = load_config()
     chain = "solana" if args.solana else "eth"
