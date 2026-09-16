@@ -1851,13 +1851,15 @@ def menu_interaktif():
 
     # ---- pilihan 1: bikin akun ----
     print()
+    chain = _tanya_pilihan("chain (tempat saldo funder)", tuple(RPC_CHAINS), "base")
     count = _tanya_int("jumlah akun", 10, 1, 100000)
     parallel = _tanya_int("concurrent (berapa proxy dicoba paralel per akun)", 6, 1, 50)
     workers = _tanya_int("batas thread", 8, 1, 64)
     claim = _tanya_pilihan("claim bonus 1M+300K?", ("y", "n"), "y") == "y"
+    cfg = {**cfg, "chains": [chain]}   # pilihan chain menimpa config utk run ini
     print()
-    print(f"rekap: {count} akun | concurrent {parallel} | thread {workers} | "
-          f"claim {'ya' if claim else 'tidak'}")
+    print(f"rekap: {count} akun | chain {chain} | concurrent {parallel} | "
+          f"thread {workers} | claim {'ya' if claim else 'tidak'}")
     if input("lanjut? [Y/n]: ").strip().lower() == "n":
         return
     return run_batch(cfg, count, "eth", "binance", "hermes", claim,
