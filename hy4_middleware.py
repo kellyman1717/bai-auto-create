@@ -34,10 +34,21 @@ SAFE = 8000           # default aman: reasoning panjang + jawaban
 _log_lock = __import__("threading").Lock()
 
 
+REASONING_MANDATORY = ("hy4", "glm-5.3-flash")  # selalu reasoning; budget kecil = jawaban kosong
+
+
 def terapkan_policy(body):
-    """Return (body_baru, catatan) — catatan None kalau tidak disentuh."""
+    """Return (body_baru, catatan) — catatan None kalau tidak disentuh.
+
+    Semua model reasoning-mandatory di b.ai: budget max_tokens kecil habis
+    untuk reasoning → content kosong walau HTTP 200. glm-5.3-flash server
+    bilang: "该模型始终思考" (selalu berpikir, tak bisa dimatikan). Karena
+    9router tidak menaikkan max_tokens untuk provider openai-compatible,
+    middleware ini yang menaikkan. Biaya dihitung token TERPAKAI, bukan
+    budget — menaikkan cap tidak menaikkan biaya.
+    """
     model = (body.get("model") or "")
-    if "hy4" not in model:
+    if not any(m in model for m in REASONING_MANDATORY):
         return body, None
     mt = body.get("max_tokens")
     if not isinstance(mt, int) or mt < 2000:
@@ -223,7 +234,10 @@ def selftest():
     body, cat = terapkan_policy({"model": "hy4-preview", "max_tokens": 6000})
     assert cat is None and body["max_tokens"] == 6000
     # model lain tak tersentuh
-    assert terapkan_policy({"model": "glm-5.3-flash", "max_tokens": 10})[1] is None
+    assert terapkan_policy({"model": "minimax-m2.7", "max_tokens": 50})[1] is None
+    # glm-5.3-flash reasoning-mandatory juga dinaikkan
+    assert terapkan_policy({"model": "glm-5.3-flash", "max_tokens": 50})[1] == "50->8000"
+    assert terapkan_policy({"model": "b.ai/glm-5.3-flash"})[1] == "none->8000"
     # hy3 juga lolos tanpa patch (bukan hy4)
     assert terapkan_policy({"model": "hy3", "max_tokens": 50})[1] is None
     # SSE fixer: finish chunk ditahan, digabung dengan usage chunk (bentuk glm)
