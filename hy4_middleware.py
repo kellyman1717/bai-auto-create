@@ -51,6 +51,68 @@ def terapkan_policy(body):
     return body, f"{asal}->{baru}"
 
 
+# ponytail: buffer SSE hanya untuk streaming POST; non-SSE lewat byte mentah.
+# Ceiling: satu chunk SSE ditahan maksimal sampai chunk berikutnya (beberapa ms).
+
+class SSEUsageFixer:
+    """Gabungkan chunk usage (choices:[]) ke chunk finish_reason sebelumnya.
+
+    9router mencatat token saat melihat chunk finish_reason (fungsi P() di
+    chunk 8895.js, dipicu oleh i.nu). glm: finish_reason + usage dalam SATU
+    chunk -> tercatat. hy4: finish chunk terpisah dari usage chunk
+    (choices:[]) -> P() sudah jalan sebelum usage tiba -> tokens 0/NULL di
+    tab usage. Solusi: tahan chunk finish, kalau chunk berikutnya usage-only,
+    gabungkan jadi satu chunk bergaya glm.
+    """
+
+    def __init__(self):
+        self.pending = None      # baris "data: {...finish tanpa usage}" yang ditahan
+        self.finishing = False   # sudah lihat finish_reason? -> jangan tahan lagi
+
+    def proses(self, data):
+        """Return bytes yang boleh dikirim ke client."""
+        out = bytearray()
+        for baris in data.split(b"\n"):
+            if not baris:            # baris kosong antar event — buang, pisah pakai \n\n
+                continue
+            if baris.startswith(b"data: "):
+                body = baris[6:]
+                if body != b"[DONE]":
+                    try:
+                        j = json.loads(body)
+                        ch = j.get("choices") or []
+                        if ch and ch[0].get("finish_reason") and not j.get("usage"):
+                            # finish tanpa usage: tahan, tunggu chunk usage
+                            self.pending = baris
+                            continue
+                        if not ch and j.get("usage") and self.pending:
+                            # usage-only: gabung ke chunk finish yang ditahan
+                            pend = json.loads(self.pending[6:])
+                            pend["usage"] = j["usage"]
+                            out += b"data: " + json.dumps(pend).encode() + b"\n\n"
+                            self.pending = None
+                            continue
+                    except Exception:
+                        pass
+                elif self.pending:
+                    # [DONE] setelah chunk finish yang ditahan -> lepas dulu
+                    out += self.pending + b"\n\n"
+                    self.pending = None
+            elif self.pending:
+                # baris non-data (comment dll) setelah finish -> lepas dulu
+                out += self.pending + b"\n\n"
+                self.pending = None
+            out += baris + b"\n"
+        return bytes(out)
+
+    def flush(self):
+        if self.pending:
+            s = self.pending + b"\n\n"
+            self.pending = None
+            return s
+        return b""
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -72,7 +134,11 @@ class Handler(BaseHTTPRequestHandler):
         hdr = {k: v for k, v in self.headers.items()
                if k.lower() not in ("host", "content-length", "accept-encoding")}
         hdr["Accept-Encoding"] = "identity"
-        stream = b'"stream":true' in raw
+        try:
+            body = json.loads(raw) if raw else {}
+            stream = bool(body.get("stream"))
+        except Exception:
+            stream = b'"stream"' in raw and b"true" in raw
         t0 = time.time()
         try:
             r = requests.request(method, url, data=raw or None, headers=hdr,
@@ -89,9 +155,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         n = 0
-        for chunk in r.iter_content(65536):
-            n += len(chunk)
-            self.wfile.write(chunk)
+        ctype = r.headers.get("content-type", "")
+        sse = stream and "text/event-stream" in ctype
+        fixer = SSEUsageFixer() if sse else None
+        buf = b""
+        try:
+            for chunk in r.iter_content(65536):
+                n += len(chunk)
+                if fixer:
+                    buf += chunk
+                    if buf.count(b"\n") >= 2:        # minimal satu event utuh
+                        baris, _, sisa = buf.rpartition(b"\n\n")
+                        self.wfile.write(fixer.proses(baris + b"\n\n"))
+                        buf = sisa
+                else:
+                    self.wfile.write(chunk)
+            if fixer:
+                sisa = fixer.proses(buf) if buf.count(b"\n") >= 2 else b""
+                self.wfile.write(sisa + fixer.flush())
+        except (requests.RequestException, BrokenPipeError, ConnectionResetError):
+            pass  # client putus — tidak ada yang bisa dikirim lagi
         with _log_lock:
             baris = (f"[{time.strftime('%H:%M:%S')}] {method} {self.path.split('?')[0]} "
                      f"{r.status_code} {n}B {time.time() - t0:.1f}s"
@@ -143,6 +226,27 @@ def selftest():
     assert terapkan_policy({"model": "glm-5.3-flash", "max_tokens": 10})[1] is None
     # hy3 juga lolos tanpa patch (bukan hy4)
     assert terapkan_policy({"model": "hy3", "max_tokens": 50})[1] is None
+    # SSE fixer: finish chunk ditahan, digabung dengan usage chunk (bentuk glm)
+    f = SSEUsageFixer()
+    fin = b'data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":"stop"}]}\n\n'
+    usg = b'data: {"choices":[],"usage":{"prompt_tokens":30,"completion_tokens":300}}\n\n'
+    done = b"data: [DONE]\n\n"
+    out1 = f.proses(fin)
+    assert out1 == b"", f"finish harus ditahan, dapat: {out1!r}"
+    out2 = f.proses(usg)
+    assert b'"finish_reason": "stop"' in out2 and b'"prompt_tokens": 30' in out2 \
+        and out2.count(b"data: ") == 1, out2
+    out3 = f.proses(done)
+    assert b"[DONE]" in out3
+    # chunk finish + DONE tanpa usage: tetap diteruskan
+    f2 = SSEUsageFixer()
+    o = f2.proses(fin + done)
+    assert b"finish_reason" in o and b"[DONE]" in o, o
+    # glm-style (usage di chunk finish) tidak diubah
+    f3 = SSEUsageFixer()
+    glm = b'data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}\n\n'
+    o = f3.proses(glm)
+    assert json.loads(o.split(b"data: ", 1)[1].split(b"\n", 1)[0])["usage"]["prompt_tokens"] == 1
     print("selftest OK")
 
 
