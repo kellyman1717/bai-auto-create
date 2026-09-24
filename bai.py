@@ -69,7 +69,7 @@ BASE = "https://chat.b.ai"
 TRPC = BASE + "/trpc/lambda"
 TEAM = "https://api.b.ai"  # teamApiUrl (REST /api/activity/*)
 TURNSTILE_SITEKEY = "0x4AAAAAADKhTSXIozuHjOoF"
-BOTERDROP = "http://127.0.0.1:8000"
+BOTERDROP = "http://127.0.0.1:8020"   # port 8000 dipakai Herd (php) — solver pindah ke 8020
 SESSION_FILE = "session_full.json"
 
 ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
