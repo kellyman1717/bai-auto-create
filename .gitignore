@@ -19,3 +19,6 @@ __pycache__/
 .venv/
 venv/
 logs/
+
+# hasil scan credit: isinya API key hidup
+hasil_scan.txt
